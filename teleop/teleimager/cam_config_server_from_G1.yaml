@@ -1,0 +1,81 @@
+# =====================================================
+# Head camera — Intel RealSense D435i RGB (OpenCV/V4L2)
+# 发现命令: teleimager-server --cf
+# =====================================================
+
+head_camera:
+  enable_zmq: true
+  zmq_port: 55555
+  enable_webrtc: true
+  webrtc_port: 60001
+  webrtc_codec: h264
+
+  type: opencv
+  fourcc: YUYV   # RealSense RGB UVC 实际为 YUYV；写 UYVY 会导致色彩错误
+
+  image_shape: [480, 640]
+  binocular: false
+  fps: 30
+
+  # RealSense RGB/depth nodes may share the same serial number.
+  # Keep serial_number null so OpenCV selection uses video_id directly.
+  serial_number: null
+  video_id: 4
+
+left_wrist_camera:
+  enable_zmq: false
+
+right_wrist_camera:
+  enable_zmq: false
+
+# =====================================================
+# Depth camera — Intel RealSense SDK depth stream (z16)
+# 启动时需要带 --rs；这里不再走 /dev/video2 的 UYVY/IR 画面
+# =====================================================
+depth_camera:
+  enable_zmq: true
+  zmq_port: 55558
+  enable_webrtc: false
+
+  type: realsense
+  stream: depth
+  shared_rgbd: false
+  depth_align_to_color: true
+  depth_align_fill_holes: true
+  depth_align_fill_iterations: 1
+  depth_spatial_filter: false
+  depth_temporal_filter: false
+  depth_hole_filling: false
+  depth_hole_filling_mode: 1
+  depth_visual_min_m: 0.2
+  depth_visual_max_m: 1.5
+  depth_colormap: turbo
+
+  image_shape: [480, 640]
+  binocular: false
+  fps: 15
+
+  # null 会自动使用第一台 RealSense；也可固定为 351623061215
+  serial_number: null
+
+# =====================================================
+# 热成像 — GY-MCU90640 串口（type: thermal）
+# 远端 teleimager-client 会显示为 "Thermal Camera" 窗口
+# =====================================================
+thermal_camera:
+  enable_zmq: true
+  zmq_port: 55559
+  enable_webrtc: false
+  optional: true              # 热成像未接/超时时仍启动 RGB
+
+  type: thermal
+  serial_port: /dev/ttyUSB0
+  baud: 460800
+  use_init: false
+  overlay: true
+  settle_s: 0.12          # START 后等待模块出帧（秒）
+  read_timeout: 1.0       # 串口读帧超时；勿设 0
+
+  image_shape: [480, 640]
+  binocular: false
+  fps: 2                  # GY-MCU 实测约 2Hz；设过高会空转

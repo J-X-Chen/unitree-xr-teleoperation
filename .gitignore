@@ -1,0 +1,33 @@
+# 数据集
+*.csv
+*.npy
+*.npz
+*.parquet
+*.h5
+*.hdf5
+*.pickle
+data/
+dataset/
+
+# 模型权重
+*.pt
+*.pth
+*.ckpt
+
+# 日志缓存
+*.log
+__pycache__/
+.ipynb_checkpoints/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+.codex
+.agents
+cert.pem
+key.pem
+certs/
+
+cjx_*
