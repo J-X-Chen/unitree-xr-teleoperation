@@ -348,6 +348,28 @@ class TeleImage:
         # state 3: decoding enabled and data available
         return self._bgr
 
+    @property
+    def image(self) -> Optional[np.ndarray]:
+        """Return the decoded image array, preserving depth PNG dtype when present."""
+        return self.bgr
+
+    @property
+    def depth(self) -> Optional[np.ndarray]:
+        """Return decoded uint16 depth if this frame carries a raw depth payload."""
+        img = self.bgr
+        if img is None:
+            return None
+        pixel_format = str(self.metadata.get("pixel_format", "")).lower()
+        encoding = str(self.metadata.get("encoding", "")).lower()
+        if (
+            "depth" in pixel_format
+            or "z16" in pixel_format
+            or "depth" in encoding
+            or (isinstance(img, np.ndarray) and img.dtype == np.uint16 and img.ndim == 2)
+        ):
+            return img
+        return None
+
     def __bool__(self):
         """ Truth value based on whether jpg byte data is available """
         return bool(self.jpg)
@@ -363,7 +385,7 @@ class TeleImage:
         size = len(self.jpg) if self.jpg else 0
         state = "DISABLED" if self._bgr is TeleImage._NOT_SET else ("FAILED" if self._bgr is None else "OK")
         return (
-            f"TeleImage(fps={self.fps:.1f}, jpg_byte_size={size}, bgr_state={state}, "
+            f"TeleImage(fps={self.fps:.1f}, payload_byte_size={size}, bgr_state={state}, "
             f"recv_time_ns={self.recv_time_ns}, capture_time_ns={self.capture_time_ns})"
         )
         
@@ -405,13 +427,22 @@ class ZMQ_SubscriberThread(threading.Thread):
             self._bgr_history_lock = None
             self._decoder_thread = None
 
-    def _decode_image(self, jpg_bytes):
-        """Decode JPEG bytes to OpenCV image."""
-        if jpg_bytes is None:
+    def _decode_image(self, img_bytes, metadata=None):
+        """Decode image bytes. Raw depth PNG is preserved as uint16 via IMREAD_UNCHANGED."""
+        if img_bytes is None:
             return None
         try:
-            np_img = np.frombuffer(jpg_bytes, dtype=np.uint8)
-            return cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+            metadata = metadata or {}
+            pixel_format = str(metadata.get("pixel_format", "")).lower()
+            encoding = str(metadata.get("encoding", "")).lower()
+            is_depth = (
+                "depth" in pixel_format
+                or "z16" in pixel_format
+                or "depth" in encoding
+            )
+            np_img = np.frombuffer(img_bytes, dtype=np.uint8)
+            flags = cv2.IMREAD_UNCHANGED if is_depth else cv2.IMREAD_COLOR
+            return cv2.imdecode(np_img, flags)
         except Exception as e:
             logger_mp.warning(f"[ZMQ_SubscriberThread] Failed to decode image: {e}")
             return None
@@ -427,7 +458,7 @@ class ZMQ_SubscriberThread(threading.Thread):
                 if jpg_bytes is None:
                     self._bgr_decode_queue.task_done()
                     continue
-                img_numpy = self._decode_image(jpg_bytes)
+                img_numpy = self._decode_image(jpg_bytes, metadata=metadata)
                 self._bgr_3ring_buffer.write((recv_time_ns, capture_time_ns, metadata, img_numpy))
                 if img_numpy is not None and self._bgr_history is not None:
                     with self._bgr_history_lock:
@@ -812,12 +843,13 @@ class ImageClient:
         "thermal_camera": "Thermal Camera",
     }
 
-    def __init__(self, host="192.168.123.164", request_port=60000, request_bgr: bool = False):
+    def __init__(self, host="192.168.123.164", request_port=60000, request_bgr: bool = False, subscribe_topics=None):
         """
         Args:
             server_address:   IP address of image host server
             request_port:     TCP port for camera configuration request
             request_bgr:      Whether to request BGR decoding for subscribers
+            subscribe_topics: Topics to pre-subscribe. None means all enabled ZMQ topics; [] means none.
         """
         self._host = host
         self._request_port = request_port
@@ -831,9 +863,12 @@ class ImageClient:
         if self._cam_config is None:
             raise RuntimeError("Failed to get camera configuration.")
         
+        subscribe_topics_set = None if subscribe_topics is None else set(subscribe_topics)
         for cam_topic, cam_cfg in self._cam_config.items():
             if not isinstance(cam_cfg, dict):
                 logger_mp.warning(f"[Image Client] Invalid camera config for {cam_topic}, skipping.")
+                continue
+            if subscribe_topics_set is not None and cam_topic not in subscribe_topics_set:
                 continue
             if not cam_cfg.get('enable_zmq', False):
                 continue

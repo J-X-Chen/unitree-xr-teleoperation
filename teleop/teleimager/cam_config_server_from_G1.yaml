@@ -29,8 +29,8 @@ right_wrist_camera:
   enable_zmq: false
 
 # =====================================================
-# Depth camera — Intel RealSense SDK depth stream (z16)
-# 启动时需要带 --rs；这里不再走 /dev/video2 的 UYVY/IR 画面
+# Depth camera — Intel RealSense SDK aligned depth stream (uint16 PNG)
+# 启动时需要带 --rs；保留当前对齐方式，只是不再保存伪彩 JPG
 # =====================================================
 depth_camera:
   enable_zmq: true
@@ -47,6 +47,7 @@ depth_camera:
   depth_temporal_filter: false
   depth_hole_filling: false
   depth_hole_filling_mode: 1
+  depth_png_compression: 1
   depth_visual_min_m: 0.2
   depth_visual_max_m: 1.5
   depth_colormap: turbo

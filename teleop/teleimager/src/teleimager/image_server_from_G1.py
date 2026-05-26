@@ -25,7 +25,8 @@ import signal
 import functools
 import subprocess
 import platform
-from .image_client import TripleRingBuffer, ZMQ_PublisherManager, ZMQ_Responser, pack_image_packet
+import struct
+from .image_client import TripleRingBuffer, ZMQ_PublisherManager, ZMQ_Responser
 # webrtc dependencies
 import asyncio
 import json
@@ -47,8 +48,34 @@ except RuntimeError:
     pass
 logger_mp = logging_mp.get_logger(__name__)
 
+IMAGE_PACKET_MAGIC = b"TELEIMG1\0"
+
+def pack_image_packet(img_bytes: bytes, **metadata) -> bytes:
+    metadata = {k: v for k, v in metadata.items() if v is not None}
+    header = json.dumps(metadata, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return IMAGE_PACKET_MAGIC + struct.pack(">I", len(header)) + header + bytes(img_bytes)
+
+def unpack_image_packet(payload: bytes):
+    if not payload or not payload.startswith(IMAGE_PACKET_MAGIC):
+        return {}, payload
+    header_start = len(IMAGE_PACKET_MAGIC)
+    header_end = header_start + 4
+    if len(payload) < header_end:
+        return {}, payload
+    header_len = struct.unpack(">I", payload[header_start:header_end])[0]
+    data_start = header_end + header_len
+    if len(payload) < data_start:
+        return {}, payload
+    try:
+        metadata = json.loads(payload[header_end:data_start].decode("utf-8"))
+        if not isinstance(metadata, dict):
+            metadata = {}
+    except Exception:
+        metadata = {}
+    return metadata, payload[data_start:]
+
 # ========================================================
-# cam_config_server.yaml path
+# cam_config_server_from_G1.yaml path
 # ========================================================
 from pathlib import Path
 CONFIG_PATH = os.path.join(
@@ -1208,7 +1235,7 @@ class RealSenseCamera(BaseCamera):
                  depth_align_fill_holes=False, depth_align_fill_iterations=1,
                  depth_spatial_filter=False, depth_temporal_filter=False,
                  depth_hole_filling=False, depth_hole_filling_mode=1,
-                 shared_rgbd=False):
+                 shared_rgbd=False, depth_png_compression=1):
         rs = self.check_pyrealsense2_install()
         super().__init__(cam_topic, img_shape, fps, enable_zmq, zmq_port, enable_webrtc, webrtc_port, webrtc_codec)
         self._rs = rs
@@ -1231,6 +1258,10 @@ class RealSenseCamera(BaseCamera):
         self._depth_temporal_filter = bool(depth_temporal_filter)
         self._depth_hole_filling = bool(depth_hole_filling)
         self._depth_hole_filling_mode = int(depth_hole_filling_mode)
+        self._depth_png_params = [
+            int(cv2.IMWRITE_PNG_COMPRESSION),
+            max(0, min(int(depth_png_compression), 9)),
+        ]
         self._latest_depth = None
         self._depth_filters = []
         self._depth_intrinsics = None
@@ -1497,6 +1528,24 @@ class RealSenseCamera(BaseCamera):
         bgr_numpy = cv2.applyColorMap(gray, colormap)
         bgr_numpy[~valid] = (0, 0, 0)
         return bgr_numpy
+
+    def _publish_depth_png(self, depth_z16: np.ndarray, capture_time_ns: int) -> None:
+        if self._enable_webrtc:
+            self._webrtc_buffer.write(self._depth_to_bgr(depth_z16))
+
+        if self._enable_zmq:
+            ok, buf = cv2.imencode(".png", depth_z16, self._depth_png_params)
+            if ok:
+                self._zmq_buffer.write(pack_image_packet(
+                    buf.tobytes(),
+                    cam_topic=self._cam_topic,
+                    capture_time_ns=capture_time_ns,
+                    encoding="png",
+                    pixel_format="depth_z16",
+                    dtype="uint16",
+                    width=int(depth_z16.shape[1]),
+                    height=int(depth_z16.shape[0]),
+                ))
     
     def _update_frame(self):
         if self._shared_rgbd:
@@ -1505,7 +1554,10 @@ class RealSenseCamera(BaseCamera):
                 self._latest_depth = self._shared_source.latest_depth()
                 if self._latest_depth is None:
                     return None
-                bgr_numpy = self._depth_to_bgr(self._latest_depth)
+                self._publish_depth_png(self._latest_depth, capture_time_ns)
+                if not self._ready.is_set():
+                    self._ready.set()
+                return
             else:
                 bgr_numpy = self._shared_source.latest_color()
                 if bgr_numpy is None:
@@ -1537,7 +1589,10 @@ class RealSenseCamera(BaseCamera):
             self._latest_depth = np.asanyarray(depth_frame.get_data())
             self._latest_depth = self._align_depth_to_color(self._latest_depth)
             self._latest_depth = self._fill_aligned_depth_holes(self._latest_depth)
-            bgr_numpy = self._depth_to_bgr(self._latest_depth)
+            self._publish_depth_png(self._latest_depth, capture_time_ns)
+            if not self._ready.is_set():
+                self._ready.set()
+            return
         else:
             aligned_frames = self.align.process(frames) if self.align is not None else frames
             color_frame = aligned_frames.get_color_frame()
@@ -2092,14 +2147,314 @@ class ThermalCamera(BaseCamera):
         logger_mp.info(f"[ThermalCamera] Released {self._cam_topic}")
 
 # ========================================================
+# G1 local episode recorder
+# ========================================================
+class EncodedEpisodeWriter:
+    def __init__(self, episode_dir, episode_id, text, frequency=30):
+        self.episode_dir = episode_dir
+        self.episode_id = int(episode_id)
+        self.color_dir = os.path.join(self.episode_dir, "colors")
+        self.depth_dir = os.path.join(self.episode_dir, "depths")
+        self.audio_dir = os.path.join(self.episode_dir, "audios")
+        self.json_path = os.path.join(self.episode_dir, "data.json")
+        self.item_id = -1
+        self.first_item = True
+        self.finalized = False
+        self._queue = queue.Queue()
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(target=self._run, daemon=True)
+
+        os.makedirs(self.color_dir, exist_ok=True)
+        os.makedirs(self.depth_dir, exist_ok=True)
+        os.makedirs(self.audio_dir, exist_ok=True)
+
+        info = {
+            "version": "1.0.0",
+            "date": time.strftime("%Y-%m-%d"),
+            "author": "unitree",
+            "image": {"width": 640, "height": 480, "fps": frequency},
+            "depth": {"width": 640, "height": 480, "fps": frequency},
+            "audio": {"sample_rate": 16000, "channels": 1, "format": "PCM", "bits": 16},
+            "joint_names": {"left_arm": [], "left_ee": [], "right_arm": [], "right_ee": [], "body": []},
+            "tactile_names": {"left_ee": [], "right_ee": []},
+            "sim_state": "",
+        }
+        with open(self.json_path, "w", encoding="utf-8") as f:
+            f.write("{\n")
+            f.write('"info": ' + json.dumps(info, ensure_ascii=False, indent=4) + ",\n")
+            f.write('"text": ' + json.dumps(text, ensure_ascii=False, indent=4) + ",\n")
+            f.write('"data": [\n')
+
+        self._worker.start()
+
+    def add_item(self, colors, depths, states, actions, tactiles=None, audios=None, sim_state=None):
+        self._queue.put({
+            "colors": colors or {},
+            "depths": depths or {},
+            "states": states,
+            "actions": actions,
+            "tactiles": tactiles,
+            "audios": audios,
+            "sim_state": sim_state,
+        })
+
+    def stop(self):
+        if self._stop_event.is_set():
+            return
+        self._stop_event.set()
+        self._queue.put(None)
+
+    def wait_finalized(self, timeout=None):
+        self._worker.join(timeout=timeout)
+        return self.finalized
+
+    def _write_encoded_map(self, base_dir, idx, data_map):
+        result = {}
+        for key, item in data_map.items():
+            payload = item.get("payload")
+            ext = item.get("ext")
+            if payload is None or ext is None:
+                continue
+            name = f"{idx:06d}_{key}.{ext}"
+            path = os.path.join(base_dir, name)
+            with open(path, "wb") as f:
+                f.write(payload)
+            result[key] = os.path.join(os.path.basename(base_dir), name)
+        return result
+
+    def _append_json_item(self, item_data):
+        with open(self.json_path, "a", encoding="utf-8") as f:
+            if not self.first_item:
+                f.write(",\n")
+            f.write(json.dumps(item_data, ensure_ascii=False, indent=4))
+            self.first_item = False
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                self._queue.task_done()
+                break
+            try:
+                self.item_id += 1
+                idx = self.item_id
+                item_data = {
+                    "idx": idx,
+                    "colors": self._write_encoded_map(self.color_dir, idx, item.get("colors", {})),
+                    "depths": self._write_encoded_map(self.depth_dir, idx, item.get("depths", {})),
+                    "states": item.get("states"),
+                    "actions": item.get("actions"),
+                    "tactiles": item.get("tactiles"),
+                    "audios": item.get("audios"),
+                    "sim_state": item.get("sim_state"),
+                }
+                self._append_json_item(item_data)
+            except Exception as exc:
+                logger_mp.error("[EncodedEpisodeWriter] failed to write item: %s", exc)
+            finally:
+                self._queue.task_done()
+
+        self._queue.join()
+        with open(self.json_path, "a", encoding="utf-8") as f:
+            f.write("\n]\n}")
+        self.finalized = True
+        logger_mp.info("[EncodedEpisodeWriter] finalized %s", self.episode_dir)
+
+
+class G1EpisodeRecorderServer:
+    def __init__(self, image_server, root_dir, host="0.0.0.0", port=60010):
+        self._image_server = image_server
+        self._root_dir = os.path.expanduser(root_dir)
+        self._host = host
+        self._port = int(port)
+        self._context = zmq.Context()
+        self._socket = self._context.socket(zmq.REP)
+        self._socket.bind(f"tcp://{self._host}:{self._port}")
+        self._running = True
+        self._active_writer = None
+        self._writers = {}
+        self._lock = threading.Lock()
+        os.makedirs(self._root_dir, exist_ok=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        logger_mp.info("[G1EpisodeRecorder] listening at %s:%d, root=%s", self._host, self._port, self._root_dir)
+
+    def _packet_to_encoded(self, packet, default_ext):
+        if packet is None:
+            return None
+        metadata, payload = unpack_image_packet(packet)
+        encoding = str(metadata.get("encoding", "")).lower()
+        pixel_format = str(metadata.get("pixel_format", "")).lower()
+        ext = "png" if encoding == "png" or "depth" in pixel_format or "z16" in pixel_format else default_ext
+        return {"payload": payload, "ext": ext}
+
+    def _capture_images(self):
+        colors = {}
+        depths = {}
+        topic_to_color_key = {
+            "head_camera": "color_0",
+            "left_wrist_camera": "color_1",
+            "right_wrist_camera": "color_2",
+        }
+        for topic, key in topic_to_color_key.items():
+            cam = self._image_server._cameras.get(topic)
+            if cam is None or not cam.enable_zmq():
+                continue
+            encoded = self._packet_to_encoded(cam.get_jpeg_bytes(), "jpg")
+            if encoded is not None:
+                colors[key] = encoded
+
+        cam = self._image_server._cameras.get("depth_camera")
+        if cam is not None and cam.enable_zmq():
+            encoded = self._packet_to_encoded(cam.get_jpeg_bytes(), "png")
+            if encoded is not None:
+                depths["depth_0"] = encoded
+        return colors, depths
+
+    def _handle_start(self, payload):
+        episode_id = int(payload["episode_id"])
+        text = {
+            "goal": payload.get("task_goal") or "Pick up the red cup on the table.",
+            "desc": payload.get("task_desc") or "task description",
+            "steps": payload.get("task_steps") or "step1: do this; step2: do that; ...",
+        }
+        episode_dir = os.path.join(self._root_dir, f"episode_{episode_id:04d}")
+        with self._lock:
+            if self._active_writer is not None:
+                raise RuntimeError("an episode is already active")
+            if os.path.exists(episode_dir):
+                raise RuntimeError(f"episode already exists in tmp_data: {episode_dir}")
+            writer = EncodedEpisodeWriter(
+                episode_dir,
+                episode_id,
+                text,
+                frequency=int(float(payload.get("frequency", 30))),
+            )
+            self._writers[episode_id] = writer
+            self._active_writer = writer
+        return {"ok": True, "episode_id": episode_id, "episode_path": episode_dir}
+
+    def _handle_add_item(self, payload):
+        episode_id = int(payload.get("episode_id", -1))
+        with self._lock:
+            writer = self._active_writer
+        if writer is None:
+            return {"ok": True, "dropped": True}
+        if writer.episode_id != episode_id:
+            return {"ok": True, "dropped": True, "reason": "stale_episode_id"}
+        colors, depths = self._capture_images()
+        writer.add_item(
+            colors=colors,
+            depths=depths,
+            states=payload.get("states"),
+            actions=payload.get("actions"),
+            tactiles=payload.get("tactiles"),
+            audios=payload.get("audios"),
+            sim_state=payload.get("sim_state"),
+        )
+        return {"ok": True}
+
+    def _handle_stop(self, payload):
+        episode_id = int(payload["episode_id"])
+        with self._lock:
+            writer = self._writers.get(episode_id)
+            if self._active_writer is writer:
+                self._active_writer = None
+        if writer is None:
+            raise RuntimeError(f"unknown episode_id {episode_id}")
+        writer.stop()
+        return {"ok": True, "episode_id": episode_id, "episode_path": writer.episode_dir}
+
+    def _handle_status(self, payload):
+        episode_id = int(payload["episode_id"])
+        writer = self._writers.get(episode_id)
+        if writer is None:
+            return {"ok": True, "episode_id": episode_id, "finalized": False, "missing": True}
+        return {
+            "ok": True,
+            "episode_id": episode_id,
+            "episode_path": writer.episode_dir,
+            "finalized": bool(writer.finalized),
+        }
+
+    def _handle_delete(self, payload):
+        episode_id = int(payload["episode_id"])
+        with self._lock:
+            writer = self._writers.get(episode_id)
+            if writer is None:
+                return {"ok": True, "missing": True}
+            if not writer.finalized:
+                raise RuntimeError(f"episode_{episode_id:04d} is not finalized")
+            self._writers.pop(episode_id, None)
+        import shutil
+        shutil.rmtree(writer.episode_dir, ignore_errors=True)
+        return {"ok": True, "episode_id": episode_id}
+
+    def _dispatch(self, payload):
+        cmd = payload.get("cmd")
+        if cmd == "start_episode":
+            return self._handle_start(payload)
+        if cmd == "add_item":
+            return self._handle_add_item(payload)
+        if cmd == "stop_episode":
+            return self._handle_stop(payload)
+        if cmd == "status":
+            return self._handle_status(payload)
+        if cmd == "delete_episode":
+            return self._handle_delete(payload)
+        if cmd == "ping":
+            return {"ok": True}
+        raise RuntimeError(f"unknown recorder command {cmd!r}")
+
+    def _run(self):
+        poller = zmq.Poller()
+        poller.register(self._socket, zmq.POLLIN)
+        while self._running:
+            try:
+                socks = dict(poller.poll(timeout=200))
+                if self._socket not in socks:
+                    continue
+                payload = self._socket.recv_json()
+                try:
+                    reply = self._dispatch(payload)
+                except Exception as exc:
+                    logger_mp.error("[G1EpisodeRecorder] command failed: %s", exc)
+                    reply = {"ok": False, "error": str(exc)}
+                self._socket.send_json(reply)
+            except zmq.ZMQError:
+                if self._running:
+                    logger_mp.exception("[G1EpisodeRecorder] ZMQ error")
+                break
+
+    def stop(self):
+        with self._lock:
+            writers = list(self._writers.values())
+            self._active_writer = None
+        for writer in writers:
+            if not writer.finalized:
+                try:
+                    writer.stop()
+                    writer.wait_finalized()
+                except Exception as exc:
+                    logger_mp.error("[G1EpisodeRecorder] failed to finalize %s: %s", writer.episode_dir, exc)
+        self._running = False
+        self._thread.join(timeout=1.0)
+        try:
+            self._socket.close()
+            self._context.term()
+        except Exception:
+            pass
+
+# ========================================================
 # image server
 # ========================================================
 class ImageServer:
-    def __init__(self, cam_config, realsense_enable=False, camera_finder_verbose=False):
+    def __init__(self, cam_config, realsense_enable=False, camera_finder_verbose=False, record_root="~/tmp_data", record_port=60010, enable_record_server=True):
         self._cam_config = cam_config
         self._realsense_enable = realsense_enable
         self._stop_event = threading.Event()
         self._cameras: dict[str, BaseCamera] = {}
+        self._record_server = None
         self._cam_finder = CameraFinder(realsense_enable, camera_finder_verbose)
         self._responser = ZMQ_Responser(self._cam_config)
         self._zmq_publisher_manager = ZMQ_PublisherManager.get_instance()
@@ -2201,6 +2556,7 @@ class ImageServer:
                             depth_hole_filling=cam_cfg.get("depth_hole_filling", False),
                             depth_hole_filling_mode=cam_cfg.get("depth_hole_filling_mode", 1),
                             shared_rgbd=cam_cfg.get("shared_rgbd", False),
+                            depth_png_compression=cam_cfg.get("depth_png_compression", 1),
                         )
 
                 elif cam_type == "uvc":
@@ -2304,6 +2660,9 @@ class ImageServer:
             self._clean_up()
             raise
 
+        if enable_record_server:
+            self._record_server = G1EpisodeRecorderServer(self, root_dir=record_root, port=record_port)
+
         logger_mp.info("[Image Server] Image server has started, waiting for client connections...")
 
     def _update_frames(self, cam_topic: str, camera: BaseCamera):
@@ -2377,6 +2736,12 @@ class ImageServer:
             self._stop_event.set()
 
     def _clean_up(self):
+        if self._record_server is not None:
+            try:
+                self._record_server.stop()
+            except Exception:
+                pass
+            self._record_server = None
         self._responser.stop()
         for t in self._publisher_threads:
             if t.is_alive():
@@ -2457,7 +2822,7 @@ def main():
         "\n"
         "The '--cf' flag means 'camera find'.\n"
         "This will list all detected cameras and their details (video paths, serial numbers and physical path etc.).\n"
-        "Use that information to fill in your 'cam_config_server.yaml' file.\n"
+        "Use that information to fill in your 'cam_config_server_from_G1.yaml' file.\n"
         "Once configured, you can start the image server with:\n"
         "\n"
         "    teleimager-server\n"
@@ -2472,6 +2837,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cf', action = 'store_true', help = 'Enable camera found mode, print all connected cameras info')
     parser.add_argument('--rs', action = 'store_true', help = 'Enable RealSense camera mode. Otherwise only find UVC/OpenCV cameras.')
+    parser.add_argument('--record-root', type=str, default='~/tmp_data', help='G1-local temporary episode root directory.')
+    parser.add_argument('--record-port', type=int, default=60010, help='G1-local episode recorder command port.')
+    parser.add_argument('--disable-record-server', action='store_true', help='Disable G1-local episode recorder server.')
     args = parser.parse_args()
 
     # if enable camera finder mode, just print cameras info and exit
@@ -2495,7 +2863,14 @@ def main():
         exit(1)
 
     # start image server
-    server = ImageServer(cam_config, realsense_enable=args.rs, camera_finder_verbose=False)
+    server = ImageServer(
+        cam_config,
+        realsense_enable=args.rs,
+        camera_finder_verbose=False,
+        record_root=args.record_root,
+        record_port=args.record_port,
+        enable_record_server=not args.disable_record_server,
+    )
     server.start()
 
     # graceful shutdown handling

@@ -227,8 +227,6 @@ class TeleVuer:
 
     async def on_controller_move(self, event, session, fps=60):
         """https://docs.vuer.ai/en/latest/examples/20_motion_controllers.html"""
-        print("\n===== CONTROLLER EVENT RECEIVED =====")
-        print(event.value)
         try:
             # ControllerData
             with self.left_arm_pose_shared.get_lock():

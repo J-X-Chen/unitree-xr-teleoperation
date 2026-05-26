@@ -20,6 +20,7 @@ from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmControl
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
+from teleop.utils.g1_episode_client import G1EpisodeClient
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
@@ -39,6 +40,8 @@ READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNI
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_START_REQUEST = False  # Request recording start
 RECORD_STOP_REQUEST  = False  # Request recording stop/save
+RECORD_TRANSFER_REQUEST = False  # Request pulling completed G1 episodes back to this machine
+RECORD_TRANSFER_RUNNING = False  # True while completed G1 episodes are being transferred
 RECORD_START_TO_HOME_TIME = 2.0     # seconds, only used right after pressing s
 RECORD_START_RETURN_TIME = 2.0      # seconds, only used right after pressing s
 RECORD_START_ARM_SMOOTH_TIME = 3.0  # seconds, used by current record-start smoothing path
@@ -66,27 +69,50 @@ class SafetyCheckError(RuntimeError):
     pass
 
 def on_press(key):
-    global STOP, START, RECORD_START_REQUEST, RECORD_STOP_REQUEST
+    global STOP, START, RECORD_START_REQUEST, RECORD_STOP_REQUEST, RECORD_TRANSFER_REQUEST
+    key = str(key).lower()
     if key == 'r':
         START = True
+        logger_mp.info("[Keyboard] r pressed: start tracking requested.")
     elif key == 'q':
         START = False
         STOP = True
+        logger_mp.info("[Keyboard] q pressed: safe shutdown requested.")
     elif key == 's' and START == True:
         RECORD_START_REQUEST = True
+        logger_mp.info("[Keyboard] s pressed: record start requested.")
     elif key == 't' and START == True:
         RECORD_STOP_REQUEST = True
+        logger_mp.info("[Keyboard] t pressed: record stop/save requested.")
+    elif key == 'p':
+        RECORD_TRANSFER_REQUEST = True
+        logger_mp.info("[Keyboard] p pressed: transfer completed G1 episodes requested.")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
+def _listen_keyboard_safe():
+    try:
+        listen_keyboard(on_press=on_press, until=None, sequential=True)
+    except ValueError as exc:
+        if "closed file" in str(exc):
+            logger_mp.debug("[Keyboard] listener exited after stdin was closed.")
+        else:
+            raise
+    except Exception as exc:
+        if STOP:
+            logger_mp.debug("[Keyboard] listener exited during shutdown: %s", exc)
+        else:
+            logger_mp.exception("[Keyboard] listener failed.")
+
 def get_state() -> dict:
     """Return current heartbeat state"""
-    global START, STOP, RECORD_RUNNING, READY
+    global START, STOP, RECORD_RUNNING, READY, RECORD_TRANSFER_RUNNING
     return {
         "START": START,
         "STOP": STOP,
         "READY": READY,
         "RECORD_RUNNING": RECORD_RUNNING,
+        "RECORD_TRANSFER_RUNNING": RECORD_TRANSFER_RUNNING,
     }
 
 def _clamp01(value):
@@ -118,6 +144,21 @@ def _controller_squeeze_value(pressed, analog_value):
     except (TypeError, ValueError):
         pass
     return 1.0 if pressed else 0.0
+
+def _image_timestamp_ns(img):
+    if img is None:
+        return None
+    return getattr(img, "capture_time_ns", None) or getattr(img, "recv_time_ns", None)
+
+def _image_within_time_window(img, target_time_ns, max_delta_s):
+    if img is None:
+        return False
+    if target_time_ns is None:
+        return True
+    img_time_ns = _image_timestamp_ns(img)
+    if img_time_ns is None:
+        return False
+    return abs(img_time_ns - target_time_ns) <= int(max_delta_s * 1_000_000_000)
 
 def _dex3_controller_pinch(tele_data, side):
     return _controller_squeeze_value(
@@ -305,6 +346,32 @@ def _ease_arm_to_q(arm_ctrl, target_q, transition_time, frequency, label):
         arm_ctrl.ctrl_dual_arm(q_cmd, zero_tauff)
         time.sleep(1.0 / frequency)
 
+def _open_end_effectors_for_shutdown(args, frequency, dex3_direct_q_target_array=None, left_gripper_value=None, right_gripper_value=None):
+    frequency = max(1.0, float(frequency))
+    hold_time = 1.0
+    steps = max(1, int(hold_time * frequency))
+
+    if args.ee in ("dex3", "dex3_true") and args.input_mode == "controller" and dex3_direct_q_target_array is not None:
+        open_q = DEX3_LEFT_OPEN_Q + DEX3_RIGHT_OPEN_Q
+        logger_mp.info("[Shutdown Guard] opening Dex3 hands over %.2fs.", hold_time)
+        for _ in range(steps):
+            with dex3_direct_q_target_array.get_lock():
+                dex3_direct_q_target_array[:] = open_q
+            time.sleep(1.0 / frequency)
+        return True
+
+    if args.ee == "dex1" and left_gripper_value is not None and right_gripper_value is not None:
+        logger_mp.info("[Shutdown Guard] opening Dex1 grippers over %.2fs.", hold_time)
+        for _ in range(steps):
+            with left_gripper_value.get_lock():
+                left_gripper_value.value = 7.0
+            with right_gripper_value.get_lock():
+                right_gripper_value.value = 7.0
+            time.sleep(1.0 / frequency)
+        return True
+
+    return False
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
@@ -330,8 +397,16 @@ if __name__ == '__main__':
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--record_debug_true', action='store_true', help='Write record_debug_*.jsonl logs for troubleshooting recording/start jitter.')
     parser.add_argument('--record-rerun-log', action='store_true', help='Enable Rerun online visualization for recorded episodes. Disabled by default to avoid control jitter on real robots.')
+    parser.add_argument('--record-backend', type=str, choices=['g1', 'local'], default='g1', help='Record episodes on G1 tmp_data or locally on this machine.')
+    parser.add_argument('--g1-record-port', type=int, default=60010, help='G1-local episode recorder command port.')
+    parser.add_argument('--record-transfer-ip', type=str, default=None, help='G1 IP used for pulling finished episodes back. Defaults to --img-server-ip.')
+    parser.add_argument('--record-transfer-user', type=str, default=None, help='SSH user for pulling G1 episodes. Defaults to current user.')
+    parser.add_argument('--record-transfer-ssh-port', type=int, default=22, help='SSH port for pulling G1 episodes.')
+    parser.add_argument('--record-transfer-bwlimit-kbps', type=int, default=4000, help='Rsync --bwlimit value for episode pullback in KiB/s. Set 0 to disable.')
+    parser.add_argument('--g1-record-max-pending-items', type=int, default=0, help='Maximum queued G1 add_item commands; 0 keeps all frames and disables realtime dropping.')
     parser.add_argument('--depth-sync-offset-s', type=float, default=0.0, help='Recording-only depth time offset. Positive means choose an older depth frame than the RGB frame.')
-    parser.add_argument('--depth-sync-max-delta-s', type=float, default=0.12, help='Maximum allowed time distance when matching depth to RGB; falls back to latest depth if no match.')
+    parser.add_argument('--depth-sync-max-delta-s', type=float, default=0.12, help='Maximum allowed time distance when matching depth to RGB; about 1-2 depth frames at 15 Hz.')
+    parser.add_argument('--depth-sync-wait-s', type=float, default=0.01, help='Recording-only wait time for a near depth frame to arrive.')
     parser.add_argument('--task-dir', type = str, default = './utils/dex3_true/', help = 'path to save data')
     parser.add_argument('--task-name', type = str, default = 'pick_cube', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
@@ -349,7 +424,14 @@ if __name__ == '__main__':
         parser.error("--shutdown-transition-time must be greater than or equal to 0.")
     if args.depth_sync_max_delta_s < 0.0:
         parser.error("--depth-sync-max-delta-s must be greater than or equal to 0.")
+    if args.depth_sync_wait_s < 0.0:
+        parser.error("--depth-sync-wait-s must be greater than or equal to 0.")
+    if args.record_transfer_bwlimit_kbps < 0:
+        parser.error("--record-transfer-bwlimit-kbps must be greater than or equal to 0.")
+    if args.g1_record_max_pending_items < 0:
+        parser.error("--g1-record-max-pending-items must be greater than or equal to 0.")
     logger_mp.info(f"args: {args}")
+    use_g1_record = args.record and args.record_backend == 'g1'
 
     record_debug_file = None
     record_debug_path = None
@@ -372,25 +454,31 @@ if __name__ == '__main__':
             ipc_server.start()
         # sshkeyboard communication mode
         else:
-            listen_keyboard_thread = threading.Thread(target=listen_keyboard, 
-                                                      kwargs={"on_press": on_press, "until": None, "sequential": False,}, 
-                                                      daemon=True)
+            listen_keyboard_thread = threading.Thread(target=_listen_keyboard_safe, daemon=True)
             listen_keyboard_thread.start()
 
         # image client
-        img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
+        img_client = ImageClient(
+            host=args.img_server_ip,
+            request_bgr=True,
+            subscribe_topics=[] if use_g1_record else None,
+        )
         camera_config = img_client.get_cam_config()
         depth_camera_cfg = camera_config.get('depth_camera', {})
         depth_zmq_enabled = depth_camera_cfg.get('enable_zmq', False)
-        if args.record and depth_zmq_enabled:
+        if args.record and depth_zmq_enabled and not use_g1_record:
             logger_mp.info(
                 f"[Image Record] depth_camera ZMQ enabled on port "
                 f"{depth_camera_cfg.get('zmq_port')}; saving frames as depths/depth_0."
             )
             logger_mp.info(
                 f"[Image Record] depth sync offset={args.depth_sync_offset_s:.3f}s, "
-                f"max_delta={args.depth_sync_max_delta_s:.3f}s."
+                f"max_delta={args.depth_sync_max_delta_s:.3f}s, "
+                f"wait={args.depth_sync_wait_s:.3f}s."
             )
+        last_depth_img = None
+        last_depth_fallback_log_t = 0.0
+        last_depth_skip_log_t = 0.0
         logger_mp.debug(f"Camera config: {camera_config}")
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
 
@@ -510,12 +598,29 @@ if __name__ == '__main__':
 
         # record + headless / non-headless mode
         if args.record:
-            recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
-                                     task_goal = args.task_goal,
-                                     task_desc = args.task_desc,
-                                     task_steps = args.task_steps,
-                                     frequency = args.frequency, 
-                                     rerun_log = args.record_rerun_log and not args.headless)
+            record_task_dir = os.path.join(args.task_dir, args.task_name)
+            if use_g1_record:
+                recorder = G1EpisodeClient(
+                    host=args.img_server_ip,
+                    task_dir=record_task_dir,
+                    task_goal=args.task_goal,
+                    task_desc=args.task_desc,
+                    task_steps=args.task_steps,
+                    frequency=args.frequency,
+                    recorder_port=args.g1_record_port,
+                    transfer_ip=args.record_transfer_ip or args.img_server_ip,
+                    transfer_user=args.record_transfer_user,
+                    transfer_ssh_port=args.record_transfer_ssh_port,
+                    transfer_bwlimit_kbps=args.record_transfer_bwlimit_kbps,
+                    max_pending_add_items=args.g1_record_max_pending_items,
+                )
+            else:
+                recorder = EpisodeWriter(task_dir = record_task_dir,
+                                         task_goal = args.task_goal,
+                                         task_desc = args.task_desc,
+                                         task_steps = args.task_steps,
+                                         frequency = args.frequency,
+                                         rerun_log = args.record_rerun_log and not args.headless)
 
         if not args.skip_ready_pose:
             _ease_arm_to_home(arm_ctrl, args.ready_transition_time, args.frequency, label="Ready Pose")
@@ -523,7 +628,7 @@ if __name__ == '__main__':
         logger_mp.info("----------------------------------------------------------------")
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
         if args.record:
-            logger_mp.info("🟡  Press [s] to START recording, [t] to STOP and SAVE recording.")
+            logger_mp.info("🟡  Press [s] to START recording, [t] to STOP and SAVE recording, [p] to PULL completed G1 episodes.")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
@@ -557,6 +662,8 @@ if __name__ == '__main__':
         record_create_done = None
         record_create_result = None
         record_stop_after_create = False
+        record_start_after_ready = False
+        record_transfer_after_ready = False
         last_arm_cmd_q = None
         last_arm_cmd_tauff = None
         record_debug_frames_remaining = 0
@@ -593,6 +700,7 @@ if __name__ == '__main__':
                     record_start_smooth_q = None
                     record_start_smooth_tauff = None
                     record_stop_after_create = False
+                    record_start_after_ready = False
                     logger_mp.error(f"Failed to create episode. Recording not started. error={create_error}")
                 record_create_thread = None
                 record_create_done = None
@@ -601,32 +709,51 @@ if __name__ == '__main__':
             # get image
             depth_img = None
             if camera_config['head_camera']['enable_zmq']:
-                if args.record or xr_need_local_img:
+                if (args.record and not use_g1_record) or xr_need_local_img:
                     head_img = img_client.get_head_frame()
                 if xr_need_local_img:
                     tv_wrapper.render_to_xr(head_img)
             if camera_config['left_wrist_camera']['enable_zmq']:
-                if args.record:
+                if args.record and not use_g1_record:
                     left_wrist_img = img_client.get_left_wrist_frame()
             if camera_config['right_wrist_camera']['enable_zmq']:
-                if args.record:
+                if args.record and not use_g1_record:
                     right_wrist_img = img_client.get_right_wrist_frame()
             if depth_zmq_enabled:
-                if args.record:
+                if args.record and not use_g1_record:
                     head_time_ns = None
+                    depth_target_time_ns = None
                     if 'head_img' in locals() and head_img is not None:
                         head_time_ns = getattr(head_img, "capture_time_ns", None) or getattr(head_img, "recv_time_ns", None)
                     if head_time_ns is not None:
                         depth_target_time_ns = head_time_ns - int(args.depth_sync_offset_s * 1_000_000_000)
-                        depth_img = img_client.get_depth_frame_near(
-                            depth_target_time_ns,
-                            max_delta_s=args.depth_sync_max_delta_s,
-                        )
+                        depth_wait_deadline = time.monotonic() + args.depth_sync_wait_s
+                        while True:
+                            depth_img = img_client.get_depth_frame_near(
+                                depth_target_time_ns,
+                                max_delta_s=args.depth_sync_max_delta_s,
+                            )
+                            if depth_img is not None or time.monotonic() >= depth_wait_deadline:
+                                break
+                            time.sleep(0.002)
                     if depth_img is None:
-                        depth_img = img_client.get_depth_frame()
+                        latest_depth_img = img_client.get_depth_frame()
+                        if _image_within_time_window(latest_depth_img, depth_target_time_ns, args.depth_sync_max_delta_s):
+                            depth_img = latest_depth_img
+                        elif _image_within_time_window(last_depth_img, depth_target_time_ns, args.depth_sync_max_delta_s):
+                            depth_img = last_depth_img
+                        now_for_log = time.monotonic()
+                        if now_for_log - last_depth_fallback_log_t > 2.0:
+                            logger_mp.warning(
+                                "[Image Record] No nearest depth hit; tried latest/last within sync window."
+                            )
+                            last_depth_fallback_log_t = now_for_log
+                    if depth_img is not None:
+                        last_depth_img = depth_img
 
             pending_record_start = False
             pending_record_stop = False
+            pending_record_transfer = False
             record_create_pending = (
                 record_create_thread is not None
                 and record_create_done is not None
@@ -634,11 +761,56 @@ if __name__ == '__main__':
             )
             record_start_requested = False
             record_stop_requested = False
+            record_transfer_requested = False
+            if args.record and use_g1_record and 'recorder' in locals():
+                RECORD_TRANSFER_RUNNING = bool(recorder.is_transferring())
+            else:
+                RECORD_TRANSFER_RUNNING = False
             if args.record:
                 record_start_requested = RECORD_START_REQUEST
                 record_stop_requested = RECORD_STOP_REQUEST
+                record_transfer_requested = RECORD_TRANSFER_REQUEST
                 RECORD_START_REQUEST = False
                 RECORD_STOP_REQUEST = False
+                RECORD_TRANSFER_REQUEST = False
+                if (
+                    record_start_after_ready
+                    and not RECORD_RUNNING
+                    and not record_create_pending
+                    and not record_transfer_requested
+                    and not record_transfer_after_ready
+                    and recorder.is_ready()
+                ):
+                    record_start_requested = True
+                    record_start_after_ready = False
+                    logger_mp.info("[Record Guard] queued start request is running now.")
+                if (
+                    record_transfer_after_ready
+                    and use_g1_record
+                    and not RECORD_RUNNING
+                    and not record_create_pending
+                    and not recorder.is_transferring()
+                    and recorder.pending_transfer_count() > 0
+                ):
+                    pending_record_transfer = True
+                    record_transfer_after_ready = False
+                    logger_mp.info("[G1EpisodeClient] queued p-transfer is running now.")
+
+            if args.record and record_transfer_requested:
+                if not use_g1_record:
+                    logger_mp.warning("[G1EpisodeClient] p ignored: current record backend is local, not G1.")
+                elif RECORD_RUNNING or record_create_pending or pending_record_start or pending_record_stop:
+                    logger_mp.warning("[G1EpisodeClient] p ignored while recording/starting/stopping. Press t first, then p after save is queued.")
+                elif recorder.is_transferring():
+                    logger_mp.warning("[G1EpisodeClient] p ignored: episode transfer is already running.")
+                elif recorder.pending_transfer_count() <= 0:
+                    if not recorder.is_ready():
+                        record_transfer_after_ready = True
+                        logger_mp.info("[G1EpisodeClient] p queued: recorder is finishing stop; transfer will start once the episode is ready.")
+                    else:
+                        logger_mp.warning("[G1EpisodeClient] p pressed, but there are no completed episodes waiting for transfer.")
+                else:
+                    pending_record_transfer = True
 
             if args.record and record_start_requested:
                 if RECORD_RUNNING:
@@ -647,11 +819,26 @@ if __name__ == '__main__':
                 elif record_create_pending:
                     _record_debug(record_debug_file, "record_start_ignored_create_pending")
                     logger_mp.warning("[Record Guard] create_episode is still pending; ignored duplicate s press.")
+                elif pending_record_transfer:
+                    _record_debug(record_debug_file, "record_start_ignored_transfer_requested")
+                    logger_mp.warning("[Record Guard] s ignored: p-transfer was requested in this cycle. Wait for it to finish.")
+                elif record_transfer_after_ready:
+                    _record_debug(record_debug_file, "record_start_ignored_transfer_queued")
+                    logger_mp.warning("[Record Guard] s ignored: p-transfer is queued. Wait for it to finish.")
+                elif use_g1_record and recorder.is_transferring():
+                    _record_debug(record_debug_file, "record_start_ignored_transfer_running")
+                    logger_mp.warning("[Record Guard] s ignored: G1 episode transfer is running. Wait for p-transfer to finish.")
                 elif not recorder.is_ready():
-                    _record_debug(record_debug_file, "record_start_ignored_not_ready")
-                    logger_mp.warning("[Record Guard] recorder is still saving; ignored s press until it is ready.")
+                    if not record_start_after_ready:
+                        _record_debug(record_debug_file, "record_start_queued_not_ready")
+                        logger_mp.info("[Record Guard] recorder is finishing the previous stop; queued s and will start as soon as it is ready.")
+                    else:
+                        _record_debug(record_debug_file, "record_start_ignored_already_queued")
+                        logger_mp.warning("[Record Guard] start is already queued; ignored duplicate s press.")
+                    record_start_after_ready = True
                 else:
                     pending_record_start = True
+                    record_start_after_ready = False
                     if last_arm_cmd_q is not None:
                         record_start_smooth_q = last_arm_cmd_q.copy()
                     else:
@@ -688,7 +875,7 @@ if __name__ == '__main__':
                     _record_debug(record_debug_file, "record_stop_ignored_not_running")
                     logger_mp.warning("[Record Guard] not recording; ignored duplicate t press.")
 
-            pending_record_command = pending_record_start or pending_record_stop
+            pending_record_command = pending_record_start or pending_record_stop or pending_record_transfer
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
@@ -737,11 +924,12 @@ if __name__ == '__main__':
                 pass
             
             # high level control
+            if args.input_mode == "controller" and tele_data.right_ctrl_aButton:
+                START = False
+                STOP = True
+                logger_mp.info("[Controller] right A pressed: safe shutdown requested.")
+
             if args.input_mode == "controller" and args.motion:
-                # quit teleoperate
-                if tele_data.right_ctrl_aButton:
-                    START = False
-                    STOP = True
                 # command robot to enter damping mode. soft emergency stop function
                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
                     loco_wrapper.Damp()
@@ -849,6 +1037,11 @@ if __name__ == '__main__':
                         record_debug_frames_remaining = int(max(1.0, RECORD_DEBUG_POST_RECORD_SECONDS) * args.frequency)
                     if args.sim:
                         publish_reset_category(1, reset_pose_publisher)
+                if pending_record_transfer:
+                    count = recorder.transfer_pending()
+                    if count > 0:
+                        RECORD_TRANSFER_RUNNING = True
+                    _record_debug(record_debug_file, "g1_transfer_requested", transfer_count=count)
 
             if record_debug_file is not None and record_debug_frames_remaining > 0:
                 _record_debug(
@@ -871,7 +1064,7 @@ if __name__ == '__main__':
                     and record_create_done is not None
                     and not record_create_done.is_set()
                 )
-                READY = recorder.is_ready() and not record_create_pending # now ready to (2) enter RECORD_RUNNING state
+                READY = recorder.is_ready() and not record_create_pending and not record_start_after_ready and not record_transfer_after_ready # now ready to (2) enter RECORD_RUNNING state
                 # dex hand or gripper
                 if (args.ee == "dex3" or args.ee == "dex3_true") and args.input_mode == "hand":
                     with dual_hand_data_lock:
@@ -947,43 +1140,53 @@ if __name__ == '__main__':
                 if RECORD_RUNNING:
                     colors = {}
                     depths = {}
-                    if camera_config['head_camera']['binocular']:
-                        if head_img is not None:
-                            colors[f"color_{0}"] = head_img.bgr[:, :camera_config['head_camera']['image_shape'][1]//2]
-                            colors[f"color_{1}"] = head_img.bgr[:, camera_config['head_camera']['image_shape'][1]//2:]
+                    record_item_ready = True
+                    if not use_g1_record:
+                        if camera_config['head_camera']['binocular']:
+                            if head_img is not None:
+                                colors[f"color_{0}"] = head_img.bgr[:, :camera_config['head_camera']['image_shape'][1]//2]
+                                colors[f"color_{1}"] = head_img.bgr[:, camera_config['head_camera']['image_shape'][1]//2:]
+                            else:
+                                logger_mp.warning("Head image is None!")
+                            if camera_config['left_wrist_camera']['enable_zmq']:
+                                if left_wrist_img is not None:
+                                    colors[f"color_{2}"] = left_wrist_img.bgr
+                                else:
+                                    logger_mp.warning("Left wrist image is None!")
+                            if camera_config['right_wrist_camera']['enable_zmq']:
+                                if right_wrist_img is not None:
+                                    colors[f"color_{3}"] = right_wrist_img.bgr
+                                else:
+                                    logger_mp.warning("Right wrist image is None!")
                         else:
-                            logger_mp.warning("Head image is None!")
-                        if camera_config['left_wrist_camera']['enable_zmq']:
-                            if left_wrist_img is not None:
-                                colors[f"color_{2}"] = left_wrist_img.bgr
+                            if head_img is not None:
+                                colors[f"color_{0}"] = head_img.bgr
                             else:
-                                logger_mp.warning("Left wrist image is None!")
-                        if camera_config['right_wrist_camera']['enable_zmq']:
-                            if right_wrist_img is not None:
-                                colors[f"color_{3}"] = right_wrist_img.bgr
+                                logger_mp.warning("Head image is None!")
+                            if camera_config['left_wrist_camera']['enable_zmq']:
+                                if left_wrist_img is not None:
+                                    colors[f"color_{1}"] = left_wrist_img.bgr
+                                else:
+                                    logger_mp.warning("Left wrist image is None!")
+                            if camera_config['right_wrist_camera']['enable_zmq']:
+                                if right_wrist_img is not None:
+                                    colors[f"color_{2}"] = right_wrist_img.bgr
+                                else:
+                                    logger_mp.warning("Right wrist image is None!")
+                        if depth_zmq_enabled:
+                            depth_array = getattr(depth_img, "depth", None) if depth_img is not None else None
+                            if depth_array is None and depth_img is not None:
+                                depth_array = getattr(depth_img, "bgr", None)
+                            if depth_array is not None:
+                                depths["depth_0"] = depth_array
                             else:
-                                logger_mp.warning("Right wrist image is None!")
-                    else:
-                        if head_img is not None:
-                            colors[f"color_{0}"] = head_img.bgr
-                        else:
-                            logger_mp.warning("Head image is None!")
-                        if camera_config['left_wrist_camera']['enable_zmq']:
-                            if left_wrist_img is not None:
-                                colors[f"color_{1}"] = left_wrist_img.bgr
-                            else:
-                                logger_mp.warning("Left wrist image is None!")
-                        if camera_config['right_wrist_camera']['enable_zmq']:
-                            if right_wrist_img is not None:
-                                colors[f"color_{2}"] = right_wrist_img.bgr
-                            else:
-                                logger_mp.warning("Right wrist image is None!")
-                    if depth_zmq_enabled:
-                        depth_bgr = getattr(depth_img, "bgr", None) if depth_img is not None else None
-                        if depth_bgr is not None:
-                            depths["depth_0"] = depth_bgr
-                        else:
-                            logger_mp.warning("Depth image is None!")
+                                record_item_ready = False
+                                now_for_log = time.monotonic()
+                                if now_for_log - last_depth_skip_log_t > 2.0:
+                                    logger_mp.warning(
+                                        "[Image Record] Skipping record item because no depth frame is within sync window."
+                                    )
+                                    last_depth_skip_log_t = now_for_log
                     states = {
                         "left_arm": {                                                                    
                             "qpos":   left_arm_state.tolist(),    # numpy.array -> list
@@ -1034,11 +1237,24 @@ if __name__ == '__main__':
                             "qpos": current_body_action,
                         }, 
                     }
-                    if args.sim:
+                    if not record_item_ready:
+                        pass
+                    elif args.sim:
                         sim_state = sim_state_subscriber.read_data()            
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, sim_state=sim_state)
+                        recorder.add_item(
+                            colors=colors,
+                            depths=depths,
+                            states=states,
+                            actions=actions,
+                            sim_state=sim_state,
+                        )
                     else:
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions)
+                        recorder.add_item(
+                            colors=colors,
+                            depths=depths,
+                            states=states,
+                            actions=actions,
+                        )
 
             current_time = time.time()
             time_elapsed = current_time - start_time
@@ -1073,6 +1289,32 @@ if __name__ == '__main__':
         logger_mp.error(traceback.format_exc())
     finally:
         try:
+            if args.record and 'recorder' in locals():
+                active_on_recorder = False
+                has_active_episode = getattr(recorder, "has_active_episode", None)
+                if callable(has_active_episode):
+                    active_on_recorder = bool(has_active_episode())
+                if RECORD_RUNNING or active_on_recorder:
+                    logger_mp.info("[Record Guard] stopping active episode before shutdown motion.")
+                    RECORD_RUNNING = False
+                    record_stop_after_create = False
+                    _record_debug(record_debug_file, "shutdown_save_episode_begin")
+                    recorder.save_episode()
+        except Exception as e:
+            logger_mp.error(f"Failed to stop active recording before shutdown motion: {e}")
+
+        try:
+            _open_end_effectors_for_shutdown(
+                args,
+                args.frequency,
+                dex3_direct_q_target_array=locals().get('dex3_direct_q_target_array'),
+                left_gripper_value=locals().get('left_gripper_value'),
+                right_gripper_value=locals().get('right_gripper_value'),
+            )
+        except Exception as e:
+            logger_mp.error(f"Failed to open end effectors during shutdown: {e}")
+
+        try:
             if 'arm_ctrl' in locals():
                 _ease_arm_to_home(arm_ctrl, args.shutdown_transition_time, args.frequency)
                 arm_ctrl.ctrl_dual_arm_go_home()
@@ -1084,9 +1326,27 @@ if __name__ == '__main__':
                 ipc_server.stop()
             else:
                 stop_listening()
-                listen_keyboard_thread.join()
+                listen_keyboard_thread.join(timeout=1.0)
+                if listen_keyboard_thread.is_alive():
+                    logger_mp.warning("[Shutdown Guard] keyboard listener did not stop within 1s; continuing shutdown.")
         except Exception as e:
             logger_mp.error(f"Failed to stop keyboard listener or ipc server: {e}")
+
+        try:
+            if args.record and 'recorder' in locals():
+                if (
+                    'record_create_thread' in locals()
+                    and record_create_thread is not None
+                    and record_create_thread.is_alive()
+                ):
+                    logger_mp.warning("[Record Guard] waiting for background create_episode before closing recorder.")
+                    record_create_thread.join(timeout=5.0)
+                    if record_create_thread.is_alive():
+                        logger_mp.warning("[Record Guard] create_episode thread is still alive; recorder.close will continue cleanup.")
+                logger_mp.info("[Shutdown Guard] robot home command sent; pulling any remaining G1 episode data before exit.")
+                recorder.close()
+        except Exception as e:
+            logger_mp.error(f"Failed to close recorder: {e}")
         
         try:
             img_client.close()
@@ -1113,23 +1373,15 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to stop sim state subscriber: {e}")
         
         try:
-            if args.record and 'recorder' in locals():
-                if (
-                    'record_create_thread' in locals()
-                    and record_create_thread is not None
-                    and record_create_thread.is_alive()
-                ):
-                    logger_mp.warning("[Record Guard] waiting for background create_episode before closing recorder.")
-                    record_create_thread.join(timeout=5.0)
-                recorder.close()
-        except Exception as e:
-            logger_mp.error(f"Failed to close recorder: {e}")
-
-        try:
             if record_debug_file is not None:
                 _record_debug(record_debug_file, "program_exit")
                 record_debug_file.close()
         except Exception as e:
             logger_mp.error(f"Failed to close record debug log: {e}")
         logger_mp.info("✅ Finally, exiting program.")
-        exit(0)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)

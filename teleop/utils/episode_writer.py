@@ -177,7 +177,7 @@ class EpisodeWriter():
         # Save depths
         if depths:
             for idx_depth, (depth_key, depth) in enumerate(depths.items()):
-                depth_name = f'{str(idx).zfill(6)}_{depth_key}.jpg'
+                depth_name = f'{str(idx).zfill(6)}_{depth_key}.png'
                 if not cv2.imwrite(os.path.join(self.depth_dir, depth_name), depth):
                     logger_mp.info(f"Failed to save depth image.")
                 item_data['depths'][depth_key] = os.path.join('depths', depth_name)

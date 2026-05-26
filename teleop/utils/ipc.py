@@ -25,6 +25,12 @@ logger_mp = logging_mp.getLogger(__name__)
         "cmd": "CMD_RECORD_TOGGLE"
     }
 
+4) transfer completed G1 episodes
+    {
+        "reqid": unique id,
+        "cmd": "CMD_TRANSFER"
+    }
+
 # Server → Client (Reply)
 1) if ok
     {
@@ -49,6 +55,7 @@ logger_mp = logging_mp.getLogger(__name__)
         "STOP" : True | False,          # whether exit program
         "RECORD_RUNNING": True | False, # whether is recording
         "RECORD_READY": True | False,   # whether ready to record
+        "RECORD_TRANSFER_RUNNING": True | False,
     }
 """
 
@@ -64,6 +71,7 @@ class IPC_Server:
         "CMD_START": "r",          # launch
         "CMD_STOP": "q",           # exit
         "CMD_RECORD_TOGGLE": "s",  # start & stop (toggle record)
+        "CMD_TRANSFER": "p",       # pull completed G1 episodes back
     }
 
     def __init__(self, on_press=None, get_state=None, hb_fps=10.0):
