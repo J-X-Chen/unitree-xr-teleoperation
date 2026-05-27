@@ -372,6 +372,39 @@ def _open_end_effectors_for_shutdown(args, frequency, dex3_direct_q_target_array
 
     return False
 
+def _close_controller(name, controller):
+    if controller is None:
+        return
+    close_fn = getattr(controller, "close", None)
+    if not callable(close_fn):
+        logger_mp.warning("[Shutdown Guard] %s has no close() method; skipping explicit close.", name)
+        return
+    logger_mp.info("[Shutdown Guard] closing %s.", name)
+    close_fn()
+
+def _terminate_active_children_for_shutdown():
+    try:
+        from multiprocessing import active_children
+    except Exception:
+        return
+    for child in active_children():
+        if not child.is_alive():
+            continue
+        logger_mp.warning(
+            "[Shutdown Guard] terminating lingering child process %s pid=%s.",
+            child.name,
+            child.pid,
+        )
+        child.terminate()
+        child.join(timeout=1.0)
+        if child.is_alive():
+            logger_mp.warning(
+                "[Shutdown Guard] child process %s still alive; killing.",
+                child.name,
+            )
+            child.kill()
+            child.join(timeout=1.0)
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
@@ -1320,6 +1353,38 @@ if __name__ == '__main__':
                 arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
+
+        try:
+            _close_controller("hand controller", locals().get('hand_ctrl'))
+            _close_controller("gripper controller", locals().get('gripper_ctrl'))
+        except Exception as e:
+            logger_mp.error(f"Failed to close end-effector controller: {e}")
+
+        try:
+            _close_controller("arm controller", locals().get('arm_ctrl'))
+        except Exception as e:
+            logger_mp.error(f"Failed to close arm controller: {e}")
+
+        try:
+            _close_controller("loco wrapper", locals().get('loco_wrapper'))
+        except Exception as e:
+            logger_mp.error(f"Failed to close loco wrapper: {e}")
+
+        try:
+            if not args.motion and 'motion_switcher' in locals():
+                for attempt in range(3):
+                    status, result = motion_switcher.Exit_Debug_Mode()
+                    logger_mp.info(
+                        f"[Shutdown Guard] Exit debug mode attempt {attempt + 1}/3: "
+                        f"status={status}, result={result}"
+                    )
+                    if status in (0, 3104):
+                        break
+                    time.sleep(0.5)
+        except Exception as e:
+            logger_mp.error(f"Failed to exit debug mode: {e}")
+
+        _terminate_active_children_for_shutdown()
         
         try:
             if args.ipc:
@@ -1359,18 +1424,12 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
 
         try:
-            if not args.motion:
-                pass
-                # status, result = motion_switcher.Exit_Debug_Mode()
-                # logger_mp.info(f"Exit debug mode: {'Success' if status == 3104 else 'Failed'}")
-        except Exception as e:
-            logger_mp.error(f"Failed to exit debug mode: {e}")
-
-        try:
             if args.sim:
                 sim_state_subscriber.stop_subscribe()
         except Exception as e:
             logger_mp.error(f"Failed to stop sim state subscriber: {e}")
+
+        _terminate_active_children_for_shutdown()
         
         try:
             if record_debug_file is not None:
@@ -1384,4 +1443,4 @@ if __name__ == '__main__':
             sys.stderr.flush()
         except Exception:
             pass
-        os._exit(0)
+        sys.exit(0)

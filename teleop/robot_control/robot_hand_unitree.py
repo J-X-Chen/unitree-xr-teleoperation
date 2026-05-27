@@ -62,6 +62,8 @@ class Dex3_1_Controller:
         self.fps = fps
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
+        self._running = True
+        self._closed = False
         if not self.Unit_Test:
             self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3)
         else:
@@ -98,16 +100,16 @@ class Dex3_1_Controller:
             with direct_q_target_array_in.get_lock():
                 direct_q_target_array_in[:] = list(self.left_hand_state_array[:]) + list(self.right_hand_state_array[:])
 
-        hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in,  self.left_hand_state_array, self.right_hand_state_array,
-                                                                          dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out,
-                                                                          direct_q_target_array_in))
-        hand_control_process.daemon = True
-        hand_control_process.start()
+        self.hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in,  self.left_hand_state_array, self.right_hand_state_array,
+                                                                               dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out,
+                                                                               direct_q_target_array_in))
+        self.hand_control_process.daemon = True
+        self.hand_control_process.start()
 
         logger_mp.info("Initialize Dex3_1_Controller OK!")
 
     def _subscribe_hand_state(self):
-        while True:
+        while self._running:
             left_hand_msg  = self.LeftHandState_subscriber.Read()
             right_hand_msg = self.RightHandState_subscriber.Read()
             if left_hand_msg is not None and right_hand_msg is not None:
@@ -142,6 +144,56 @@ class Dex3_1_Controller:
         self.LeftHandCmb_publisher.Write(self.left_msg)
         self.RightHandCmb_publisher.Write(self.right_msg)
         # logger_mp.debug("hand ctrl publish ok.")
+
+    def _write_zero_torque_commands(self, repeats=10):
+        left_msg = unitree_hg_msg_dds__HandCmd_()
+        right_msg = unitree_hg_msg_dds__HandCmd_()
+        left_q = list(self.left_hand_state_array[:])
+        right_q = list(self.right_hand_state_array[:])
+
+        for idx, id in enumerate(Dex3_1_Left_JointIndex):
+            cmd = left_msg.motor_cmd[id]
+            cmd.mode = self._RIS_Mode(id=id, status=0x00)._mode_to_uint8()
+            cmd.q = left_q[idx]
+            cmd.dq = 0.0
+            cmd.tau = 0.0
+            cmd.kp = 0.0
+            cmd.kd = 0.0
+        for idx, id in enumerate(Dex3_1_Right_JointIndex):
+            cmd = right_msg.motor_cmd[id]
+            cmd.mode = self._RIS_Mode(id=id, status=0x00)._mode_to_uint8()
+            cmd.q = right_q[idx]
+            cmd.dq = 0.0
+            cmd.tau = 0.0
+            cmd.kp = 0.0
+            cmd.kd = 0.0
+
+        for _ in range(max(1, int(repeats))):
+            self.LeftHandCmb_publisher.Write(left_msg)
+            self.RightHandCmb_publisher.Write(right_msg)
+            time.sleep(0.02)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._running = False
+        proc = getattr(self, "hand_control_process", None)
+        if proc is not None and proc.is_alive():
+            logger_mp.info("[Dex3_1_Controller] terminating hand control process.")
+            proc.terminate()
+            proc.join(timeout=1.0)
+            if proc.is_alive():
+                logger_mp.warning("[Dex3_1_Controller] hand process still alive; killing.")
+                proc.kill()
+                proc.join(timeout=1.0)
+        try:
+            self._write_zero_torque_commands()
+            logger_mp.info("[Dex3_1_Controller] zero-torque command sent.")
+        except Exception as exc:
+            logger_mp.error("[Dex3_1_Controller] failed to send zero-torque command: %s", exc)
+        if self.subscribe_state_thread.is_alive():
+            self.subscribe_state_thread.join(timeout=1.0)
     
     def control_process(self, left_hand_array_in, right_hand_array_in, left_hand_state_array, right_hand_state_array,
                               dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None,
@@ -288,6 +340,8 @@ class Dex1_1_Gripper_Controller:
         self.Unit_Test = Unit_Test
         self.gripper_sub_ready = False
         self.simulation_mode = simulation_mode
+        self.running = True
+        self._closed = False
         
         if filter and not self.simulation_mode:
             self.smooth_filter = WeightedMovingFilter(np.array([0.5, 0.3, 0.2]), 2)
@@ -327,7 +381,7 @@ class Dex1_1_Gripper_Controller:
         logger_mp.info("Initialize Dex1_1_Gripper_Controller OK!")
 
     def _subscribe_gripper_state(self):
-        while True:
+        while self.running:
             left_gripper_msg  = self.LeftGripperState_subscriber.Read()
             right_gripper_msg  = self.RightGripperState_subscriber.Read()
             self.gripper_sub_ready = True
@@ -344,10 +398,43 @@ class Dex1_1_Gripper_Controller:
         self.LeftGripperCmb_publisher.Write(self.left_gripper_msg)
         self.RightGripperCmb_publisher.Write(self.right_gripper_msg)
         # logger_mp.debug("gripper ctrl publish ok.")
+
+    def _write_zero_torque_commands(self, repeats=10):
+        left_msg = MotorCmds_()
+        left_msg.cmds = [unitree_go_msg_dds__MotorCmd_()]
+        right_msg = MotorCmds_()
+        right_msg.cmds = [unitree_go_msg_dds__MotorCmd_()]
+
+        left_msg.cmds[0].q = self.left_gripper_state_value.value
+        right_msg.cmds[0].q = self.right_gripper_state_value.value
+        for msg in (left_msg, right_msg):
+            msg.cmds[0].dq = 0.0
+            msg.cmds[0].tau = 0.0
+            msg.cmds[0].kp = 0.0
+            msg.cmds[0].kd = 0.0
+
+        for _ in range(max(1, int(repeats))):
+            self.LeftGripperCmb_publisher.Write(left_msg)
+            self.RightGripperCmb_publisher.Write(right_msg)
+            time.sleep(0.02)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self.running = False
+        if self.gripper_control_thread.is_alive():
+            self.gripper_control_thread.join(timeout=1.0)
+        try:
+            self._write_zero_torque_commands()
+            logger_mp.info("[Dex1_1_Gripper_Controller] zero-torque command sent.")
+        except Exception as exc:
+            logger_mp.error("[Dex1_1_Gripper_Controller] failed to send zero-torque command: %s", exc)
+        if self.subscribe_state_thread.is_alive():
+            self.subscribe_state_thread.join(timeout=1.0)
     
     def control_thread(self, left_gripper_value_in, right_gripper_value_in, left_gripper_state_value, right_gripper_state_value, dual_hand_data_lock = None, 
                              dual_gripper_state_out = None, dual_gripper_action_out = None):
-        self.running = True
         DELTA_GRIPPER_CMD = 0.18     # The motor rotates 5.4 radians, the clamping jaw slide open 9 cm, so 0.6 rad <==> 1 cm, 0.18 rad <==> 3 mm
         THUMB_INDEX_DISTANCE_MIN = 5.0
         THUMB_INDEX_DISTANCE_MAX = 7.0

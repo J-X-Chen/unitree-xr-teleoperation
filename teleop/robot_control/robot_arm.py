@@ -75,6 +75,8 @@ class G1_29_ArmController:
         self.all_motor_q = None
         self.arm_velocity_limit = 20.0
         self.control_dt = 1.0 / 250.0
+        self._running = True
+        self._closed = False
 
         self._speed_gradual_max = False
         self._gradual_start_time = None
@@ -141,7 +143,7 @@ class G1_29_ArmController:
         logger_mp.info("Initialize G1_29_ArmController OK!")
 
     def _subscribe_motor_state(self):
-        while True:
+        while self._running:
             msg = self.lowstate_subscriber.Read()
             if msg is not None:
                 lowstate = G1_29_LowState()
@@ -162,7 +164,7 @@ class G1_29_ArmController:
         if self.motion_mode:
             self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 1.0;
 
-        while True:
+        while self._running:
             start_time = time.time()
 
             with self.ctrl_lock:
@@ -235,6 +237,24 @@ class G1_29_ArmController:
                 break
             current_attempts += 1
             time.sleep(0.05)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        logger_mp.info("[G1_29_ArmController] stopping arm control threads.")
+        try:
+            with self.ctrl_lock:
+                self.q_target = self.get_current_dual_arm_q()
+                self.tauff_target = np.zeros_like(self.tauff_target)
+            time.sleep(0.05)
+        except Exception as exc:
+            logger_mp.warning("[G1_29_ArmController] failed to stage zero torque before close: %s", exc)
+        self._running = False
+        if self.publish_thread.is_alive():
+            self.publish_thread.join(timeout=1.0)
+        if self.subscribe_thread.is_alive():
+            self.subscribe_thread.join(timeout=1.0)
 
     def speed_gradual_max(self, t = 5.0):
         '''Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0.'''
@@ -359,6 +379,8 @@ class G1_23_ArmController:
         self.all_motor_q = None
         self.arm_velocity_limit = 20.0
         self.control_dt = 1.0 / 250.0
+        self._running = True
+        self._closed = False
 
         self._speed_gradual_max = False
         self._gradual_start_time = None
@@ -426,7 +448,7 @@ class G1_23_ArmController:
         logger_mp.info("Initialize G1_23_ArmController OK!")
 
     def _subscribe_motor_state(self):
-        while True:
+        while self._running:
             msg = self.lowstate_subscriber.Read()
             if msg is not None:
                 lowstate = G1_23_LowState()
@@ -447,7 +469,7 @@ class G1_23_ArmController:
         if self.motion_mode:
             self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = 1.0;
 
-        while True:
+        while self._running:
             start_time = time.time()
 
             with self.ctrl_lock:
@@ -520,6 +542,24 @@ class G1_23_ArmController:
                 break
             current_attempts += 1
             time.sleep(0.05)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        logger_mp.info("[G1_23_ArmController] stopping arm control threads.")
+        try:
+            with self.ctrl_lock:
+                self.q_target = self.get_current_dual_arm_q()
+                self.tauff_target = np.zeros_like(self.tauff_target)
+            time.sleep(0.05)
+        except Exception as exc:
+            logger_mp.warning("[G1_23_ArmController] failed to stage zero torque before close: %s", exc)
+        self._running = False
+        if self.publish_thread.is_alive():
+            self.publish_thread.join(timeout=1.0)
+        if self.subscribe_thread.is_alive():
+            self.subscribe_thread.join(timeout=1.0)
 
     def speed_gradual_max(self, t = 5.0):
         '''Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0.'''
@@ -636,6 +676,8 @@ class H1_2_ArmController:
         self.all_motor_q = None
         self.arm_velocity_limit = 20.0
         self.control_dt = 1.0 / 250.0
+        self._running = True
+        self._closed = False
 
         self._speed_gradual_max = False
         self._gradual_start_time = None
@@ -703,7 +745,7 @@ class H1_2_ArmController:
         logger_mp.info("Initialize H1_2_ArmController OK!")
 
     def _subscribe_motor_state(self):
-        while True:
+        while self._running:
             msg = self.lowstate_subscriber.Read()
             if msg is not None:
                 lowstate = H1_2_LowState()
@@ -724,7 +766,7 @@ class H1_2_ArmController:
         if self.motion_mode:
             self.msg.motor_cmd[H1_2_JointIndex.kNotUsedJoint0].q = 1.0;
 
-        while True:
+        while self._running:
             start_time = time.time()
 
             with self.ctrl_lock:
@@ -797,6 +839,24 @@ class H1_2_ArmController:
                 break
             current_attempts += 1
             time.sleep(0.05)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        logger_mp.info("[H1_2_ArmController] stopping arm control threads.")
+        try:
+            with self.ctrl_lock:
+                self.q_target = self.get_current_dual_arm_q()
+                self.tauff_target = np.zeros_like(self.tauff_target)
+            time.sleep(0.05)
+        except Exception as exc:
+            logger_mp.warning("[H1_2_ArmController] failed to stage zero torque before close: %s", exc)
+        self._running = False
+        if self.publish_thread.is_alive():
+            self.publish_thread.join(timeout=1.0)
+        if self.subscribe_thread.is_alive():
+            self.subscribe_thread.join(timeout=1.0)
 
     def speed_gradual_max(self, t = 5.0):
         '''Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0.'''
@@ -917,6 +977,8 @@ class H1_ArmController:
         self.all_motor_q = None
         self.arm_velocity_limit = 20.0
         self.control_dt = 1.0 / 250.0
+        self._running = True
+        self._closed = False
 
         self._speed_gradual_max = False
         self._gradual_start_time = None
@@ -974,7 +1036,7 @@ class H1_ArmController:
         logger_mp.info("Initialize H1_ArmController OK!")
 
     def _subscribe_motor_state(self):
-        while True:
+        while self._running:
             msg = self.lowstate_subscriber.Read()
             if msg is not None:
                 lowstate = H1_LowState()
@@ -992,7 +1054,7 @@ class H1_ArmController:
         return cliped_arm_q_target
 
     def _ctrl_motor_state(self):
-        while True:
+        while self._running:
             start_time = time.time()
 
             with self.ctrl_lock:
@@ -1057,6 +1119,24 @@ class H1_ArmController:
                 break
             current_attempts += 1
             time.sleep(0.05)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        logger_mp.info("[H1_ArmController] stopping arm control threads.")
+        try:
+            with self.ctrl_lock:
+                self.q_target = self.get_current_dual_arm_q()
+                self.tauff_target = np.zeros_like(self.tauff_target)
+            time.sleep(0.05)
+        except Exception as exc:
+            logger_mp.warning("[H1_ArmController] failed to stage zero torque before close: %s", exc)
+        self._running = False
+        if self.publish_thread.is_alive():
+            self.publish_thread.join(timeout=1.0)
+        if self.subscribe_thread.is_alive():
+            self.subscribe_thread.join(timeout=1.0)
 
     def speed_gradual_max(self, t = 5.0):
         '''Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0.'''

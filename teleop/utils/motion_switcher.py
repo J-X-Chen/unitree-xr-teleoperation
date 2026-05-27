@@ -86,6 +86,12 @@ class LocoClientWrapper:
     def Move(self, vx, vy, vyaw):
         self.client.Move(vx, vy, vyaw, continous_move=False)
 
+    def close(self):
+        try:
+            self.client.Move(0.0, 0.0, 0.0, continous_move=False)
+        except Exception as e:
+            logger_mp.warning(f"[LocoClientWrapper] stop move failed during close: {e}")
+
 if __name__ == '__main__':
     ChannelFactoryInitialize(1) # 0 for real robot, 1 for simulation
     ms = MotionSwitcher()
