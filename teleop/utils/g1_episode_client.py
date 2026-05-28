@@ -393,7 +393,7 @@ class G1EpisodeClient:
         if not isinstance(data, list):
             raise RuntimeError(f"invalid data.json: data is not a list in {local_path}")
         for row in data:
-            for section in ("colors", "depths", "audios"):
+            for section in ("colors", "depths", "thermography", "audios"):
                 entries = row.get(section) or {}
                 if not isinstance(entries, dict):
                     raise RuntimeError(f"invalid {section} entry in {local_path}")
